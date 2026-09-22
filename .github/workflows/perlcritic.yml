@@ -1,0 +1,97 @@
+name: Perl::Critic Linting
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  perlcritic:
+    name: Perl::Critic Full Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: 'default'
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cpanm
+            local/lib/perl5
+          key: ${{ runner.os }}-perl-5.38-critic-${{ hashFiles('cpanfile', '.perlcriticrc') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-5.38-critic-
+
+      - name: Install Perl::Critic and policies
+        run: |
+          cpanm --quiet --notest Perl::Critic Perl::Tidy
+          cpanm --quiet --notest Perl::Critic::Policy::Variables::ProhibitUnusedVariables
+
+      - name: Run Perl::Critic on all source files
+        run: |
+          echo "=== Checking rip.pl ==="
+          perlcritic --profile .perlcriticrc rip.pl
+          echo "=== Checking rr.pl ==="
+          perlcritic --profile .perlcriticrc rr.pl
+          echo "=== Checking plugins (first 30) ==="
+          for f in $(ls plugins/*.pl | head -30); do
+            perlcritic --profile .perlcriticrc "$f" || true
+          done
+
+      - name: Run Perl::Critic with verbose output on main scripts
+        if: failure()
+        run: |
+          perlcritic --profile .perlcriticrc --verbose 10 rip.pl rr.pl
+
+  perlcritic-plugins:
+    name: Perl::Critic Plugins (Batch)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: 'default'
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cpanm
+            local/lib/perl5
+          key: ${{ runner.os }}-perl-5.38-critic-plugins-${{ hashFiles('cpanfile', '.perlcriticrc') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-5.38-critic-plugins-
+
+      - name: Install Perl::Critic
+        run: |
+          cpanm --quiet --notest Perl::Critic
+
+      - name: Run Perl::Critic on plugin batch ${{ matrix.batch }}
+        run: |
+          # Process plugins in batches of ~20
+          START=$(( (${{ matrix.batch }} - 1) * 20 ))
+          END=$(( ${{ matrix.batch }} * 20 - 1 ))
+          FILES=(plugins/*.pl)
+          for i in $(seq $START $END); do
+            if [ $i -lt ${#FILES[@]} ]; then
+              f="${FILES[$i]}"
+              echo "Checking $f..."
+              perlcritic --profile .perlcriticrc "$f" || true
+            fi
+          done

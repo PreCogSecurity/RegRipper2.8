@@ -17,6 +17,7 @@
 #   20090102 - updated code for relative path to plugins dir
 #   20080419 - added '-g' switch (experimental)
 #   20080412 - added '-c' switch
+#   20260922 - added input validation, path traversal protection, security hardening
 #
 # copyright 2013 Quantum Analytics Research, LLC
 # Author: H. Carvey, keydet89@yahoo.com
@@ -25,9 +26,12 @@
 # http://www.gnu.org/licenses/gpl.html
 #-------------------------------------------------------------------------
 use strict;
+use warnings;
 use Parse::Win32Registry qw(:REG_);
 use Getopt::Long;
 use File::Spec;
+use File::Basename qw(basename);
+use Cwd qw(abs_path);
 
 # Included to permit compiling via Perl2Exe
 #perl2exe_include "Parse/Win32Registry.pm";
@@ -66,6 +70,9 @@ my $plugindir = File::Spec->catfile("plugins");
 my $VERSION = "2\.8_20130801";
 my @alerts = ();
 
+# Security: Validate and sanitize inputs early
+validate_config(\%config);
+
 if ($config{help} || !%config) {
 	_syntax();
 	exit;
@@ -76,9 +83,9 @@ if ($config{help} || !%config) {
 #-------------------------------------------------------------
 if ($config{list}) {
 	my @plugins;
-	opendir(DIR,$plugindir) || die "Could not open $plugindir: $!\n";
-	@plugins = readdir(DIR);
-	closedir(DIR);
+	opendir(my $dh, $plugindir) || die "Could not open $plugindir: $!\n";
+	@plugins = readdir($dh);
+	closedir($dh);
 
 	my $count = 1; 
 	print "Plugin,Version,Hive,Description\n" if ($config{csv});
@@ -115,7 +122,7 @@ if ($config{file}) {
 # correct
 	my $hive = $config{reg};
 	die "You must enter a hive file path/name.\n" if ($hive eq "");
-#	die $hive." not found.\n" unless (-e $hive);
+	# Hive file validation done in validate_config()
 	
 	my %plugins = parsePluginsFile($config{file});
 	if (%plugins) {
@@ -148,7 +155,7 @@ if ($config{reg} && $config{guess}) {
 # Attempt to guess which kind of hive we have
 	my $hive = $config{reg};
 	die "You must enter a hive file path/name.\n" if ($hive eq "");
-#	die $hive." not found.\n" unless (-e $hive);
+	# Hive file validation done in validate_config()
 	
 	my $reg;
 	my $root_key;
@@ -167,13 +174,13 @@ if ($config{plugin}) {
 # correct
 	my $hive = $config{reg};
 	die "You must enter a hive file path/name.\n" if ($hive eq "");
-#	die $hive." not found.\n" unless (-e $hive);	
-		
+	# Hive file validation done in validate_config()
+	
 # check to see if the plugin exists
 	my $plugin = $config{plugin};
 #	my $pluginfile = $plugindir.$config{plugin}."\.pl";
 	my $pluginfile = File::Spec->catfile($plugindir,$config{plugin}."\.pl");
-	die $pluginfile." not found.\n" unless (-e $pluginfile);
+	die $pluginfile." not found.\n" unless (-e $pluginfile && -f $pluginfile);
 	
 	eval {
 		require $pluginfile;
@@ -183,6 +190,159 @@ if ($config{plugin}) {
 		logMsg("Error in ".$pluginfile.": ".$@);
 	}	
 	printAlerts();
+}
+
+#-------------------------------------------------------------
+# validate_config()
+# Validate and sanitize configuration inputs
+#-------------------------------------------------------------
+sub validate_config {
+    my $cfg = shift;
+    
+    # Validate hive file path if provided
+    if (exists $cfg->{reg} && defined $cfg->{reg} && $cfg->{reg} ne '') {
+        $cfg->{reg} = sanitize_path($cfg->{reg});
+        validate_hive_file($cfg->{reg});
+    }
+    
+    # Validate plugin profile file if provided
+    if (exists $cfg->{file} && defined $cfg->{file} && $cfg->{file} ne '') {
+        $cfg->{file} = sanitize_plugin_profile($cfg->{file});
+    }
+    
+    # Validate single plugin name if provided
+    if (exists $cfg->{plugin} && defined $cfg->{plugin} && $cfg->{plugin} ne '') {
+        $cfg->{plugin} = sanitize_plugin_name($cfg->{plugin});
+    }
+    
+    # Validate system name for TLN (alphanumeric, dash, underscore only)
+    if (exists $cfg->{sys} && defined $cfg->{sys} && $cfg->{sys} ne '') {
+        $cfg->{sys} = sanitize_tln_field($cfg->{sys}, 'system name');
+    }
+    
+    # Validate user name for TLN (alphanumeric, dash, underscore only)
+    if (exists $cfg->{user} && defined $cfg->{user} && $cfg->{user} ne '') {
+        $cfg->{user} = sanitize_tln_field($cfg->{user}, 'user name');
+    }
+}
+
+#-------------------------------------------------------------
+# sanitize_path()
+# Prevent path traversal attacks
+#-------------------------------------------------------------
+sub sanitize_path {
+    my $path = shift;
+    
+    # Remove null bytes
+    $path =~ s/\0//g;
+    
+    # Get absolute path
+    my $abs_path = eval { abs_path($path) } || $path;
+    
+    # Ensure path doesn't contain directory traversal attempts
+    # after normalization (abs_path should resolve .. but we double-check)
+    if ($abs_path =~ m/\.\./) {
+        die "Invalid path: directory traversal detected\n";
+    }
+    
+    return $abs_path;
+}
+
+#-------------------------------------------------------------
+# validate_hive_file()
+# Validate that hive file exists and has valid signature
+#-------------------------------------------------------------
+sub validate_hive_file {
+    my $hive = shift;
+    
+    # Check file exists and is readable
+    die "Hive file not found: $hive\n" unless (-e $hive);
+    die "Hive file not readable: $hive\n" unless (-r $hive);
+    die "Hive path is not a file: $hive\n" unless (-f $hive);
+    
+    # Check file size (prevent DoS with huge files)
+    my $size = -s $hive;
+    die "Hive file is empty: $hive\n" if ($size == 0);
+    
+    # Optional: Check for reasonable max size (1GB default)
+    my $max_size = 1024 * 1024 * 1024; # 1GB
+    die "Hive file too large (>1GB): $hive\n" if ($size > $max_size);
+    
+    # Validate registry hive signature (first 4 bytes should be 'regf')
+    open(my $fh, '<:raw', $hive) or die "Cannot open hive file: $hive\n";
+    my $header;
+    read($fh, $header, 4);
+    close($fh);
+    
+    unless ($header eq 'regf') {
+        logMsg("Warning: File may not be a valid registry hive (missing 'regf' signature): $hive");
+        # Don't die, just warn - some hives might have different signatures
+    }
+}
+
+#-------------------------------------------------------------
+# sanitize_plugin_profile()
+# Validate plugin profile name (no path traversal)
+#-------------------------------------------------------------
+sub sanitize_plugin_profile {
+    my $profile = shift;
+    
+    # Remove null bytes
+    $profile =~ s/\0//g;
+    
+    # Only allow alphanumeric, dash, underscore
+    $profile =~ s/[^a-zA-Z0-9_-]//g;
+    
+    # Prevent empty after sanitization
+    die "Invalid plugin profile name\n" if ($profile eq '');
+    
+    # Verify profile file exists in plugins directory
+    my $profile_file = File::Spec->catfile($plugindir, $profile);
+    die "Plugin profile not found: $profile\n" unless (-e $profile_file && -f $profile_file);
+    
+    return $profile;
+}
+
+#-------------------------------------------------------------
+# sanitize_plugin_name()
+# Validate plugin module name (no path traversal)
+#-------------------------------------------------------------
+sub sanitize_plugin_name {
+    my $plugin = shift;
+    
+    # Remove null bytes
+    $plugin =~ s/\0//g;
+    
+    # Only allow alphanumeric, dash, underscore
+    $plugin =~ s/[^a-zA-Z0-9_-]//g;
+    
+    # Prevent empty after sanitization
+    die "Invalid plugin name\n" if ($plugin eq '');
+    
+    # Verify plugin file exists in plugins directory
+    my $plugin_file = File::Spec->catfile($plugindir, $plugin . ".pl");
+    die "Plugin not found: $plugin\n" unless (-e $plugin_file && -f $plugin_file);
+    
+    return $plugin;
+}
+
+#-------------------------------------------------------------
+# sanitize_tln_field()
+# Validate TLN system/user name fields
+#-------------------------------------------------------------
+sub sanitize_tln_field {
+    my ($field, $field_name) = @_;
+    
+    # Remove null bytes
+    $field =~ s/\0//g;
+    
+    # Only allow alphanumeric, dash, underscore, dot, space
+    $field =~ s/[^a-zA-Z0-9_. -]//g;
+    
+    # Limit length
+    $field = substr($field, 0, 64);
+    
+    return $field;
 }
 
 sub _syntax {
@@ -263,10 +423,10 @@ sub parsePluginsFile {
 # choose different plugins files	
 #	my $pluginfile = $plugindir.$file;
 	my $pluginfile = File::Spec->catfile($plugindir,$file);
-	if (-e $pluginfile) {
-		open(FH,"<",$pluginfile);
+	if (-e $pluginfile && -f $pluginfile) {
+		open(my $fh, '<', $pluginfile) or die "Cannot open plugin file: $pluginfile\n";
 		my $count = 1;
-		while(<FH>) {
+		while(<$fh>) {
 			chomp;
 			next if ($_ =~ m/^#/ || $_ =~ m/^\s+$/);
 #			next unless ($_ =~ m/\.pl$/);
@@ -275,7 +435,7 @@ sub parsePluginsFile {
 			$_ =~ s/\s+$//;
 			$plugins{$count++} = $_; 
 		}
-		close(FH);
+		close($fh);
 		return %plugins;
 	}
 	else {
