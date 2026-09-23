@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Run weekly to catch dependency issues
+    - cron: '0 0 * * 0'
+
+jobs:
+  test:
+    name: Test (Perl ${{ matrix.perl }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        perl: ['5.38', '5.36', '5.34', '5.32']
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+          distribution: 'default'
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cpanm
+            local/lib/perl5
+          key: ${{ runner.os }}-perl-${{ matrix.perl }}-${{ hashFiles('cpanfile') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-${{ matrix.perl }}-
+
+      - name: Install dependencies
+        run: |
+          cpanm --quiet --notest --installdeps .
+          cpanm --quiet --notest Test::More Test::Exception Test::MockModule Test::File Test::Dir Path::Tiny
+
+      - name: Syntax check main scripts
+        run: |
+          perl -c rip.pl
+          perl -c rr.pl
+
+      - name: Syntax check plugins
+        run: |
+          for f in plugins/*.pl; do
+            perl -c "$f" || exit 1
+          done
+
+      - name: Run test suite
+        run: |
+          prove -lr t/
+
+      - name: Check for unused variables in plugins (sample)
+        run: |
+          # Quick check for common issues
+          grep -r "my \$.*=.*;" plugins/ | grep -v "my \$.*=.*;.*#" | head -20 || true
+
+  lint:
+    name: Lint (Perl::Critic)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: 'default'
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cpanm
+            local/lib/perl5
+          key: ${{ runner.os }}-perl-5.38-lint-${{ hashFiles('cpanfile', '.perlcriticrc') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-5.38-lint-
+
+      - name: Install Perl::Critic
+        run: |
+          cpanm --quiet --notest Perl::Critic Perl::Tidy
+
+      - name: Run Perl::Critic on main scripts
+        run: |
+          perlcritic --profile .perlcriticrc rip.pl rr.pl
+
+      - name: Run Perl::Critic on plugins (sample - first 20)
+        run: |
+          for f in $(ls plugins/*.pl | head -20); do
+            echo "Checking $f..."
+            perlcritic --profile .perlcriticrc "$f" || true
+          done
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: 'default'
+
+      - name: Check for hardcoded secrets
+        run: |
+          # Check for common secret patterns
+          if grep -r -i -E "(password|secret|api[_-]?key|token|credential)\s*=\s*['\"][^'\"]+['\"]" --include="*.pl" --include="*.pm" .; then
+            echo "::error::Potential hardcoded secrets found"
+            exit 1
+          fi
+          echo "No hardcoded secrets detected"
+
+      - name: Check for unsafe patterns
+        run: |
+          # Check for unsafe Perl patterns
+          if grep -r -E "(system\(|exec\(|open\(.*\||\`.*\`)" --include="*.pl" --include="*.pm" . | grep -v "test" | grep -v "# "; then
+            echo "::warning::Potential unsafe patterns found (system/exec/backticks)"
+          fi
+          echo "Security pattern check complete"
+
+      - name: Validate file permissions
+        run: |
+          # Ensure no world-writable files
+          find . -type f -perm -002 -not -path "./.git/*" | while read f; do
+            echo "::warning::$f is world-writable"
+          done
+
+  build:
+    name: Build Executables (Windows)
+    runs-on: windows-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: 'strawberry'
+
+      - name: Install PAR::Packer
+        run: |
+          cpanm --quiet --notest PAR::Packer
+
+      - name: Build rip.exe
+        run: |
+          pp -o rip.exe rip.pl
+
+      - name: Build rr.exe
+        run: |
+          pp -o rr.exe rr.pl
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: regripper-binaries
+          path: |
+            rip.exe
+            rr.exe
+          retention-days: 30

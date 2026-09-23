@@ -29,7 +29,7 @@
 #             from plugin dir
 #           - Log file now based on report file name and location
 #  20080226 - added eval{} to wrap require pragma in go_Click() 
-#  
+#  20260922 - added input validation, path traversal protection, security hardening
 #
 # Functionality: 
 #   - plugins file is selectable
@@ -40,9 +40,13 @@
 # This software is released via the GPL v3.0 license:
 # http://www.gnu.org/licenses/gpl.html
 #-----------------------------------------------------------
-#use strict;
+use strict;
+use warnings;
 use Win32::GUI();
 use Parse::Win32Registry qw(:REG_);
+use File::Spec;
+use File::Basename qw(basename);
+use Cwd qw(abs_path);
 
 # Included to permit compiling via Perl2Exe
 #perl2exe_include "Parse/Win32Registry.pm";
@@ -64,6 +68,88 @@ use Parse::Win32Registry qw(:REG_);
 my $VERSION = "2\.8";
 my %env; 
 my @alerts = ();
+
+# Security: Plugin directory (validated)
+my $plugindir = File::Spec->catfile("plugins");
+
+#-----------------------------------------------------------
+# Security Validation Functions
+#-----------------------------------------------------------
+
+#-------------------------------------------------------------
+# sanitize_path()
+# Prevent path traversal attacks
+#-------------------------------------------------------------
+sub sanitize_path {
+    my $path = shift;
+    
+    # Remove null bytes
+    $path =~ s/\0//g;
+    
+    # Get absolute path
+    my $abs_path = eval { abs_path($path) } || $path;
+    
+    # Ensure path doesn't contain directory traversal attempts
+    if ($abs_path =~ m/\.\./) {
+        die "Invalid path: directory traversal detected\n";
+    }
+    
+    return $abs_path;
+}
+
+#-------------------------------------------------------------
+# validate_hive_file()
+# Validate that hive file exists and has valid signature
+#-------------------------------------------------------------
+sub validate_hive_file {
+    my $hive = shift;
+    
+    # Check file exists and is readable
+    die "Hive file not found: $hive\n" unless (-e $hive);
+    die "Hive file not readable: $hive\n" unless (-r $hive);
+    die "Hive path is not a file: $hive\n" unless (-f $hive);
+    
+    # Check file size (prevent DoS with huge files)
+    my $size = -s $hive;
+    die "Hive file is empty: $hive\n" if ($size == 0);
+    
+    # Optional: Check for reasonable max size (1GB default)
+    my $max_size = 1024 * 1024 * 1024; # 1GB
+    die "Hive file too large (>1GB): $hive\n" if ($size > $max_size);
+    
+    # Validate registry hive signature (first 4 bytes should be 'regf')
+    open(my $fh, '<:raw', $hive) or die "Cannot open hive file: $hive\n";
+    my $header;
+    read($fh, $header, 4);
+    close($fh);
+    
+    unless ($header eq 'regf') {
+        logMsg("Warning: File may not be a valid registry hive (missing 'regf' signature): $hive");
+    }
+}
+
+#-------------------------------------------------------------
+# sanitize_plugin_profile()
+# Validate plugin profile name (no path traversal)
+#-------------------------------------------------------------
+sub sanitize_plugin_profile {
+    my $profile = shift;
+    
+    # Remove null bytes
+    $profile =~ s/\0//g;
+    
+    # Only allow alphanumeric, dash, underscore
+    $profile =~ s/[^a-zA-Z0-9_-]//g;
+    
+    # Prevent empty after sanitization
+    die "Invalid plugin profile name\n" if ($profile eq '');
+    
+    # Verify profile file exists in plugins directory
+    my $profile_file = File::Spec->catfile($plugindir, $profile);
+    die "Plugin profile not found: $profile\n" unless (-e $profile_file && -f $profile_file);
+    
+    return $profile;
+}
 
 #-----------------------------------------------------------
 # GUI
@@ -222,8 +308,19 @@ sub browse1_Click {
                    -title  => "Open a hive file",
                    -filter => ['All files' => '*.*',],
                    );
-  
-  $ntuserfile->Text($file);
+   
+  if ($file) {
+      # Validate the selected hive file
+      eval {
+          $file = sanitize_path($file);
+          validate_hive_file($file);
+      };
+      if ($@) {
+          Win32::GUI::MessageBox($main, "Invalid hive file: $@", "Error", 16);
+          return 0;
+      }
+      $ntuserfile->Text($file);
+  }
   0;
 }
 
@@ -246,16 +343,39 @@ sub browse2_Click {
 sub go_Click {	
 # Set up the environment
 	setUpEnv();
+	
+	# Validate hive file
 	if ($env{ntuser} eq "") {
 		Win32::GUI::MessageBox($main,$ENV{USERNAME}.", you did not select a hive file.\r\n",
 		                       "Doh!!",16);
 		return;
 	}
+	
+	# Validate hive file path and signature
+	eval {
+		$env{ntuser} = sanitize_path($env{ntuser});
+		validate_hive_file($env{ntuser});
+	};
+	if ($@) {
+		Win32::GUI::MessageBox($main, "Invalid hive file: $@", "Error", 16);
+		return;
+	}
+	
 # Get the selected item from the Plugins file listbox
 # only allows for single selections at this time; defaults to ntuser
 # if none selected
 	my $pluginfile = $combo->GetLBText($combo->GetCurSel());
 	$pluginfile = "ntuser" if ($pluginfile eq "");
+	
+	# Validate plugin profile
+	eval {
+		$pluginfile = sanitize_plugin_profile($pluginfile);
+	};
+	if ($@) {
+		Win32::GUI::MessageBox($main, "Invalid plugin profile: $@", "Error", 16);
+		return;
+	}
+	
 	$report->Append("Logging to ".$env{logfile}."\r\n");
 	$report->Append("Using plugins file ".$pluginfile."\r\n");
 	logMsg("Log opened.");
@@ -271,7 +391,9 @@ sub go_Click {
 	my $err_cnt = 0;
 	foreach my $i (sort {$a <=> $b} keys %plugins) {
 		eval {
-			require "plugins\\".$plugins{$i}."\.pl";
+			# Use File::Spec for safe path construction
+			my $plugin_path = File::Spec->catfile($plugindir, $plugins{$i} . ".pl");
+			require $plugin_path;
 			$plugins{$i}->pluginmain($env{ntuser});
 		};
 		if ($@) {
@@ -361,9 +483,9 @@ sub setUpEnv {
 #-----------------------------------------------------------
 sub getProfiles {
 	my @pluginfiles;
-	opendir(DIR,"plugins");
-	my @files = readdir(DIR);
-	close(DIR);
+	opendir(my $dh, $plugindir) || die "Could not open $plugindir: $!\n";
+	my @files = readdir($dh);
+	close($dh);
 	
 	foreach my $f (@files) {
 		next if ($f =~ m/^\.$/ || $f =~ m/^\.\.$/);
@@ -392,11 +514,11 @@ sub parsePluginsFile {
 # Parse a file containing a list of plugins
 # Future versions of this tool may allow for the analyst to 
 # choose different plugins files	
-	my $pluginfile = "plugins\\".$file;
-	if (-e $pluginfile) {
-		open(FH,"<",$pluginfile);
+	my $pluginfile = File::Spec->catfile($plugindir, $file);
+	if (-e $pluginfile && -f $pluginfile) {
+		open(my $fh, '<', $pluginfile) or die "Cannot open plugin file: $pluginfile\n";
 		my $count = 1;
-		while(<FH>) {
+		while(<$fh>) {
 			chomp;
 			next if ($_ =~ m/^#/ || $_ =~ m/^\s+$/);
 #			next unless ($_ =~ m/\.pl$/);
@@ -405,7 +527,7 @@ sub parsePluginsFile {
 			$_ =~ s/\s+$//;
 			$plugins{$count++} = $_; 
 		}
-		close(FH);
+		close($fh);
 		$status->Text("Plugin file parsed and loaded.");
 		return %plugins;
 	}
@@ -416,16 +538,16 @@ sub parsePluginsFile {
 }
 
 sub logMsg {
-	open(FH,">>",$env{logfile});
-	print FH localtime(time).": ".$_[0]."\n";
-	close(FH);
+	open(my $fh, '>>', $env{logfile}) or die "Cannot open log file: $env{logfile}\n";
+	print $fh localtime(time).": ".$_[0]."\n";
+	close($fh);
 }
 
 sub rptMsg {
-	open(FH,">>",$env{rptfile});
-	binmode FH,":utf8";
-	print FH $_[0]."\n";
-	close(FH);
+	open(my $fh, '>>', $env{rptfile}) or die "Cannot open report file: $env{rptfile}\n";
+	binmode $fh, ":utf8";
+	print $fh $_[0]."\n";
+	close($fh);
 }
 
 sub alertMsg {
